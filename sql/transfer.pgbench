@@ -1,0 +1,5 @@
+-- One random customer-to-customer transfer. Run with -D naccts=<max account id>.
+\set a random(2, :naccts)
+\set b random(2, :naccts)
+\set cents random(100, 500000)
+SELECT core.transfer(:a, :b, :cents / 100.0);

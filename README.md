@@ -1,84 +1,104 @@
 # pg-ops-lab
 
-A PostgreSQL 17 operations lab built around a small core-banking database. It covers:
+I built this to practise the parts of database admin work you hope you never need:
+building a replica, restoring a backup after someone breaks the data, and failing
+over when the primary dies. Everything is a script, so I can run the same drill
+again and get real numbers instead of guessing.
 
-- streaming replication
-- verified backups
-- point-in-time recovery from a real mistake
-- unplanned failover
-
-Each one is a repeatable drill script that measures its own result. It runs on a laptop with plain PostgreSQL binaries. No Docker.
-
-## Results
-
-From a clean run on a MacBook Air (M1, 8 GB), all nodes on localhost, with 300 transfers per second running throughout. The full log is in [`results/drill-log.md`](results/drill-log.md).
-
-| Drill | Result |
-|---|---|
-| Build a standby, then see a commit on it | **22 ms** after commit |
-| Base backup, SHA-256 manifest verified | **0.8 s** for 59 MB |
-| Find the bad `UPDATE` in the WAL | **exact xid**, no statement logging needed |
-| Restore to just before it (RTO) | **0.8 s** |
-| Rows committed before the incident that were lost (RPO) | **0** |
-| Repair production in place, no downtime | **0.1 s**, all 20,001 accounts proven to the cent |
-| Crash the primary, promote the standby | **0.3 s**, apps reconnect on their own |
-| Committed transfers lost on failover | **0** (async and sync) |
-| Cost of synchronous replication | **+0.22 ms** per commit (2.01 ms vs 2.24 ms) |
-| Rejoin the crashed node with `pg_rewind` | **0.9 s** |
+It runs PostgreSQL 17 on my laptop (M1 MacBook Air, 8 GB) using the plain Postgres
+binaries. No Docker.
 
 ## The database
 
-Customers, accounts, and an append-only **double-entry ledger**:
+A small banking setup: customers, accounts and a ledger. Every transfer writes two
+ledger rows, a debit and a credit, and an account's balance is just the total of
+its ledger rows. That gives me an easy way to check nothing is broken. The whole
+ledger has to add up to zero, and every balance has to match its rows. Every drill
+runs this check at the end.
 
-- Every transfer writes one debit and one credit, so the ledger always nets to zero.
-- `accounts.balance` is a cached value that can always be rebuilt from the ledger.
-- `core.transfer()` locks both accounts in id order, so two opposite transfers can't deadlock.
-- `core.verify_integrity()` checks three things: the ledger nets to zero, every balance matches its ledger, and every transfer is balanced. Every drill runs it.
+While the drills run, pgbench keeps about 300 transfers a second going, so nothing
+is tested on an idle database.
 
-## The drills
+## Results
 
-| Script | What it does |
+From my last full run:
+
+| Test | Result |
 |---|---|
-| `01-primary.sh` | Creates a primary with data checksums, SCRAM auth on TCP, WAL archiving and commit timestamps. Adds a `replicator` role with REPLICATION only. |
-| `02-seed.sh` | Loads the schema, 10,000 customers, 20,001 accounts and opening deposits. |
-| `03-replica.sh` | Builds a hot standby with `pg_basebackup` and a replication slot. Checks streaming, catch-up time and read-only mode. |
-| `04-backup.sh` | Takes a base backup, runs `pg_verifybackup` on it, keeps the newest 3 backups and cleans old WAL with `pg_archivecleanup`. |
-| `05-pitr-drill.sh` | Runs live load, then someone runs `UPDATE core.accounts SET balance = 0` with no WHERE. The script finds that transaction in the WAL with `pg_waldump`, restores to just before it on a scratch instance, proves nothing was lost, repairs production in place, and cross-checks every account. |
-| `06-failover-drill.sh [--sync]` | Crashes the primary under load and promotes the standby. Counts exactly which commits were lost, then `pg_rewind`s the old primary back as a standby. Run it again and the roles swap back. |
-| `status.sh` | Shows node roles, timelines, replication, WAL held by slots, the archiver and backups. |
-| `teardown.sh` | Removes everything (or `teardown.sh restore` for just the scratch instance). |
+| New commit shows up on the replica | 22 ms |
+| Take a backup and verify it | 0.8 s |
+| Restore to just before a bad UPDATE | 0.8 s, nothing lost |
+| Fix the live database after that UPDATE | 0.1 s, no downtime |
+| Kill the primary and promote the replica | 0.3 s, no transfers lost |
+| Bring the old primary back as a replica | 0.9 s |
+| Extra cost of synchronous replication | about 0.2 ms per commit |
 
-The step-by-step procedures behind these are in [`docs/RUNBOOK.md`](docs/RUNBOOK.md). [`docs/MSSQL-MAPPING.md`](docs/MSSQL-MAPPING.md) maps each step to its SQL Server equivalent.
+Every run is logged in `results/drill-log.md`.
 
-## Run it
+## The restore drill
 
-You need PostgreSQL 17 binaries that include `pg_basebackup`, `pg_rewind`, `pg_waldump` and `pgbench`. I used the EDB macOS build, unzipped, with no installer. Point `PGBIN` in `lab.env` at its `bin` directory.
+Halfway through the load, I run `UPDATE core.accounts SET balance = 0` with no
+WHERE clause. Then the script has to:
 
-```sh
-./scripts/01-primary.sh
-./scripts/02-seed.sh
-./scripts/03-replica.sh
-./scripts/04-backup.sh
-./scripts/05-pitr-drill.sh
-./scripts/06-failover-drill.sh
-./scripts/06-failover-drill.sh --sync
-./scripts/status.sh
-./scripts/teardown.sh
-```
+1. Find that transaction in the WAL with `pg_waldump`. I didn't want this to depend
+   on statement logging, because production usually has it off.
+2. Restore the last backup to a separate instance, stopping right before that
+   transaction.
+3. Check that nothing committed before the mistake is missing.
+4. Fix the live database.
 
-Cluster data lives in `~/.pg-ops-lab`, outside the repo. Ports are 55432 to 55434.
+Step 4 was the interesting part. My first thought was to switch over to the
+restored copy, but by the time it's ready, the live database has kept taking
+transfers. In my run that was 6,203 transfers that would have been thrown away.
+The ledger wasn't touched, so I rebuilt the balances from it on the live database
+and only used the restored copy to prove every account matched.
 
-## Decisions worth explaining
+One thing I didn't expect: in the early runs, the bad UPDATE kept losing deadlocks
+to the live transfers and rolling back, and those rollbacks still show up in the
+WAL. So the script looks for the newest *committed* transaction that touched most
+of the table, not just the biggest one.
 
-- **Find the bad transaction in the WAL, not the logs.** Production rarely logs every statement. `pg_waldump` filtered to one table shows which transaction rewrote nearly every row. Aborted attempts show up too, so the script checks `pg_xact_status` and takes the newest committed one.
-- **Stop at an xid, not a timestamp.** Under concurrent load a timestamp is a guess. With `recovery_target_xid` and `inclusive = off`, recovery stops exactly before that commit.
-- **Repair in place instead of promoting the restore.** In the recorded run, promoting the restored copy would have thrown away 6,203 legitimate transfers committed after the mistake. The ledger was untouched, so the balances were rebuilt from it in one transaction. The restored copy is used as proof, not as the fix.
-- **A restored copy never archives.** It runs with `archive_mode = off`, so its new timeline can never mix into the live WAL archive.
-- **Measure data loss exactly.** `track_commit_timestamp` and starting the crashed node in isolation let the drill compare actual commits, instead of estimating from lag.
-- **Least privilege by default.** Replication uses a role that can only replicate. TCP needs a SCRAM password. Sockets live in a directory only the owner can open.
+## The failover drill
 
-## Limits
+The script kills the primary with `pg_ctl stop -m immediate` (the same as pulling
+the plug) and promotes the replica. The app connection string lists both servers
+with `target_session_attrs=read-write`, so clients find the new primary on their
+own.
 
-- **One machine.** The async loss window is effectively zero on localhost. Over a real network it is the WAL not yet sent, and `--sync` closes it at the cost of commit latency.
-- **Manual promotion, on purpose.** These are the steps a failover manager like Patroni or repmgr automates. Doing them by hand shows what that tooling is doing.
-- **Backups on the same disk.** Production would ship base backups and WAL to separate storage with pgBackRest or Barman, with encryption and offsite copies.
+To count exactly what was lost, I start the crashed server on its own, with no
+network access, and compare its ledger with the new primary's. Then `pg_rewind`
+brings it back as a replica. Run the script again and the roles swap back.
+
+Run it with `--sync` to compare async and synchronous replication. On one machine
+async lost nothing too, but over a real network it would, and synchronous mode is
+how you close that gap.
+
+## Running it
+
+You need PostgreSQL 17 with `pg_basebackup`, `pg_rewind`, `pg_waldump` and
+`pgbench`. Set `PGBIN` in `lab.env` to point at them.
+
+    ./scripts/01-primary.sh        # primary with checksums, archiving, SCRAM
+    ./scripts/02-seed.sh           # 10,000 customers, 20,001 accounts
+    ./scripts/03-replica.sh        # streaming replica with a slot
+    ./scripts/04-backup.sh         # backup, verify, clean old WAL
+    ./scripts/05-pitr-drill.sh     # the restore drill
+    ./scripts/06-failover-drill.sh # add --sync for synchronous
+    ./scripts/status.sh
+    ./scripts/teardown.sh
+
+The data lives in `~/.pg-ops-lab`, outside the repo.
+
+## Docs
+
+- `docs/RUNBOOK.md` has each procedure written as a step by step SOP.
+- `docs/MSSQL-MAPPING.md` exists because I started on SQL Server. It lines up each
+  step with what I'd do there (log backups, STOPBEFOREMARK, Always On and so on).
+
+## What's missing
+
+- Everything runs on one machine.
+- Promotion is manual. In production, Patroni or repmgr would handle it, but I
+  wanted to do the steps by hand first.
+- Backups sit on the same disk. A real setup would send them to separate storage
+  with something like pgBackRest or Barman.
